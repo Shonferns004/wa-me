@@ -1,0 +1,48 @@
+import { memo } from 'react';
+import Linkify from 'linkify-react';
+import { parseMessageBody } from '../../utils/messageFormatter';
+const linkifyOptions = {
+    target: '_blank',
+    rel: 'noopener noreferrer',
+    defaultProtocol: 'https',
+    // 'bdi' isolates a resolved @mention (see the 'mention' case below) from Linkify: a push name
+    // is attacker-controlled text, and linkify-react auto-links a bare word with no scheme (e.g.
+    // "localhost"), so character-stripping the name is not enough — keeping it out of Linkify's own
+    // tree walk is what stops it. 'bdi' also isolates a right-to-left name's directionality.
+    ignoreTags: ['code', 'pre', 'bdi'],
+    attributes: {
+        onClick: (e) => e.stopPropagation(),
+    },
+};
+/**
+ * Longest body handed to Linkify. Its scan of an unbroken run of domain-like characters grows with
+ * the square of the run, so a longer body renders without links instead of freezing the thread.
+ */
+const MAX_LINKED_LENGTH = 4096;
+function renderNode(node, key) {
+    switch (node.type) {
+        case 'text':
+            return <span key={key}>{node.value}</span>;
+        case 'bold':
+            return <strong key={key}>{node.children.map(renderNode)}</strong>;
+        case 'italic':
+            return <em key={key}>{node.children.map(renderNode)}</em>;
+        case 'strike':
+            return <s key={key}>{node.children.map(renderNode)}</s>;
+        case 'code':
+            return <code key={key}>{node.value}</code>;
+        case 'codeblock':
+            return (<pre key={key}>
+          <code>{node.value}</code>
+        </pre>);
+        case 'mention':
+            return <bdi key={key}>{node.value}</bdi>;
+    }
+}
+function MessageBodyBase({ text, className, enableLinks = true }) {
+    const nodes = parseMessageBody(text);
+    const rendered = <>{nodes.map(renderNode)}</>;
+    const linked = enableLinks && text.length <= MAX_LINKED_LENGTH;
+    return <div className={className}>{linked ? <Linkify options={linkifyOptions}>{rendered}</Linkify> : rendered}</div>;
+}
+export default memo(MessageBodyBase);

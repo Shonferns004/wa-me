@@ -1,0 +1,53 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const class_validator_1 = require("class-validator");
+const class_transformer_1 = require("class-transformer");
+const is_session_id_validator_1 = require("./is-session-id.validator");
+const api_key_dto_1 = require("./api-key.dto");
+/**
+ * `allowedSessions` is stored in a `simple-array` column: TypeORM joins on write and splits on
+ * read. Two entry shapes therefore do not survive the round trip, and both fail OPEN.
+ *
+ * `['']` joins to `''`, reads back as `[]`, and every enforcement site treats a zero-length list as
+ * "every session" — so a request that looked like a scoping landed as a widening. An entry holding
+ * a comma comes back as two entries, so the stored allowlist is not the one that was sent.
+ */
+describe('isSessionId', () => {
+    it.each(['0a941dac-a965-45e7-b318-74ae8be134f0', 'legacy-id', 'a'])('accepts %p', value => {
+        expect((0, is_session_id_validator_1.isSessionId)(value)).toBe(true);
+    });
+    it.each([
+        ['', 'empty: joins to the same string as an unscoped key'],
+        ['   ', 'whitespace only: trims to empty'],
+        [' id', 'leading space: never equals a stored id'],
+        ['id ', 'trailing space: never equals a stored id'],
+        ['a,b', 'comma: splits into two entries on read'],
+    ])('rejects %p (%s)', value => {
+        expect((0, is_session_id_validator_1.isSessionId)(value)).toBe(false);
+    });
+    it.each([undefined, null, 42, {}, []])('rejects the non-string %p', value => {
+        expect((0, is_session_id_validator_1.isSessionId)(value)).toBe(false);
+    });
+});
+describe('allowedSessions validation on the DTOs', () => {
+    const errorsFor = async (Dto, allowedSessions) => {
+        const dto = (0, class_transformer_1.plainToInstance)(Dto, { name: 'k', allowedSessions });
+        const errors = await (0, class_validator_1.validate)(dto, { whitelist: true });
+        return errors.filter(e => e.property === 'allowedSessions');
+    };
+    it.each([api_key_dto_1.CreateApiKeyDto, api_key_dto_1.UpdateApiKeyDto])('%p refuses the fail-open [""]', async (Dto) => {
+        expect(await errorsFor(Dto, [''])).not.toHaveLength(0);
+    });
+    it.each([api_key_dto_1.CreateApiKeyDto, api_key_dto_1.UpdateApiKeyDto])('%p refuses a comma-bearing entry', async (Dto) => {
+        expect(await errorsFor(Dto, ['a,b'])).not.toHaveLength(0);
+    });
+    it.each([api_key_dto_1.CreateApiKeyDto, api_key_dto_1.UpdateApiKeyDto])('%p refuses duplicates', async (Dto) => {
+        expect(await errorsFor(Dto, ['same', 'same'])).not.toHaveLength(0);
+    });
+    // The unscoped forms stay valid: they are the documented way to grant every session.
+    it.each([api_key_dto_1.CreateApiKeyDto, api_key_dto_1.UpdateApiKeyDto])('%p still accepts an empty list and a real id', async (Dto) => {
+        expect(await errorsFor(Dto, [])).toHaveLength(0);
+        expect(await errorsFor(Dto, ['0a941dac-a965-45e7-b318-74ae8be134f0'])).toHaveLength(0);
+        expect(await errorsFor(Dto, undefined)).toHaveLength(0);
+    });
+});

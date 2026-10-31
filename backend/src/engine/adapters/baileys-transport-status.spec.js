@@ -1,0 +1,61 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const boom_1 = require("@hapi/boom");
+const baileys_groups_1 = require("./baileys-groups");
+const engine_transport_error_1 = require("../../common/errors/engine-transport.error");
+const engine_refused_error_1 = require("../../common/errors/engine-refused.error");
+const invalid_invite_code_error_1 = require("../../common/errors/invalid-invite-code.error");
+/**
+ * Two sites turn a transport fault into a CLIENT error, which is the one thing their own comments
+ * say must not happen. Neither goes through a catch on the timeout path:
+ *
+ *  - groupAcceptInvite RESOLVES undefined rather than throwing, so `if (!jid)` raises a 400 —
+ *    "the invite code may be invalid" — for a query that never came back.
+ *  - groupParticipantsUpdate yields [], so the empty-results guard raises a 403 refusal.
+ */
+const never = () => new Promise(() => undefined);
+function groups(sock, budgetMs) {
+    const host = {
+        ensureReady: () => undefined,
+        getSocket: () => sock,
+        logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
+        toNeutralJid: (j) => j,
+        toEngineJid: (j) => j,
+        normalizedSelfJid: () => '628177@s.whatsapp.net',
+    };
+    return new baileys_groups_1.BaileysGroups(host, budgetMs);
+}
+describe('joinGroupViaInviteCode', () => {
+    it('reports an unanswered join instead of calling the invite code invalid', async () => {
+        await expect(groups({ groupAcceptInvite: jest.fn(never) }, 15).joinGroupViaInviteCode('CODE')).rejects.toBeInstanceOf(engine_transport_error_1.EngineTransportError);
+    });
+    it('still calls a genuinely refused invite invalid', async () => {
+        const groupAcceptInvite = jest.fn().mockRejectedValue(new boom_1.Boom('gone', { data: 410 }));
+        await expect(groups({ groupAcceptInvite }, 500).joinGroupViaInviteCode('BAD')).rejects.toBeInstanceOf(invalid_invite_code_error_1.InvalidInviteCodeError);
+    });
+    it('reports a rate-limited join as retryable instead of calling the invite code invalid', async () => {
+        const groupAcceptInvite = jest.fn().mockRejectedValue(new boom_1.Boom('rate-overlimit', { data: 429 }));
+        await expect(groups({ groupAcceptInvite }, 500).joinGroupViaInviteCode('CODE')).rejects.toBeInstanceOf(engine_transport_error_1.EngineTransportError);
+    });
+    it('still calls an answered-but-empty result invalid — that is a real refusal', async () => {
+        const groupAcceptInvite = jest.fn().mockResolvedValue(undefined);
+        await expect(groups({ groupAcceptInvite }, 500).joinGroupViaInviteCode('BAD')).rejects.toBeInstanceOf(invalid_invite_code_error_1.InvalidInviteCodeError);
+    });
+    it('still returns the joined group id', async () => {
+        const groupAcceptInvite = jest.fn().mockResolvedValue('120363000@g.us');
+        await expect(groups({ groupAcceptInvite }, 500).joinGroupViaInviteCode('CODE')).resolves.toBe('120363000@g.us');
+    });
+});
+describe('participant updates', () => {
+    it('reports an unanswered update instead of a permissions refusal', async () => {
+        await expect(groups({ groupParticipantsUpdate: jest.fn(never) }, 15).addParticipants('123@g.us', ['628111@c.us'])).rejects.toBeInstanceOf(engine_transport_error_1.EngineTransportError);
+    });
+    it('still reports an answered-but-empty outcome as a refusal', async () => {
+        const groupParticipantsUpdate = jest.fn().mockResolvedValue([]);
+        await expect(groups({ groupParticipantsUpdate }, 500).addParticipants('123@g.us', ['628111@c.us'])).rejects.toBeInstanceOf(engine_refused_error_1.EngineRefusedError);
+    });
+    it('still maps a per-participant outcome', async () => {
+        const groupParticipantsUpdate = jest.fn().mockResolvedValue([{ status: '200', jid: '628111@s.whatsapp.net' }]);
+        await expect(groups({ groupParticipantsUpdate }, 500).addParticipants('123@g.us', ['628111@c.us'])).resolves.toEqual([{ id: '628111@s.whatsapp.net', success: true, status: 200 }]);
+    });
+});

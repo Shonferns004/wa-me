@@ -1,0 +1,59 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.THROTTLER_REDIS_SOCKET_TIMEOUT_MS = exports.THROTTLER_REDIS_COMMAND_TIMEOUT_MS = void 0;
+exports.buildThrottlerRedisOptions = buildThrottlerRedisOptions;
+exports.createThrottlerRedisClient = createThrottlerRedisClient;
+const ioredis_1 = __importDefault(require("ioredis"));
+const redis_options_1 = require("../../config/redis-options");
+/**
+ * Upper bound for one throttler command. The storage fails OPEN on command error, so a bounded
+ * rejection is how a slow/partitioned Redis degrades to "allow" instead of stalling the request.
+ * It also settles commands ioredis drops on reconnect (autoResendUnfulfilledCommands: false below),
+ * which would otherwise never resolve.
+ */
+exports.THROTTLER_REDIS_COMMAND_TIMEOUT_MS = 2000;
+/**
+ * How long the throttler's socket may stay silent after a write before it is destroyed. Kept below the command
+ * timeout: with the two equal, the socket is torn down in the same millisecond the first command gives up, and
+ * the next tier's command is written to the still-open socket first, so a second request waits out its own timeout.
+ */
+exports.THROTTLER_REDIS_SOCKET_TIMEOUT_MS = 1500;
+/**
+ * Client options for the throttler's Redis backend, tuned so the fail-open posture of
+ * RedisThrottlerStorage engages IMMEDIATELY instead of after a stall:
+ *
+ * - enableOfflineQueue: false — a command issued while disconnected rejects at once
+ *   ("Stream isn't writeable...") rather than sitting in the offline queue until reconnect.
+ *   The default (queue + flush on recovery) both stalls every request for seconds and replays
+ *   the non-idempotent INCR evals late, corrupting the fixed-window counts.
+ * - autoResendUnfulfilledCommands: false — an eval in flight when the socket dies is NOT resent
+ *   after reconnect: a resent INCR can double-count (if it already ran server-side) or land in a
+ *   fresh window. Dropping it is safe because commandTimeout settles the awaiting caller.
+ * - commandTimeout — per-command deadline covering the two cases above (dropped in-flight
+ *   commands never settle on their own) plus a live-but-slow Redis.
+ * - maxRetriesPerRequest: null — disables ioredis's periodic pending-queue flush; with the
+ *   offline queue disabled there is nothing to flush, and per-command latency is bounded by
+ *   commandTimeout instead of a retry counter.
+ * - socketTimeout: a peer that stays connected but stops answering never errors the socket, so
+ *   commandTimeout alone makes every guarded request wait one full timeout per throttler tier
+ *   (three tiers, 6 s in total) until TCP gives up. socketTimeout destroys the stalled socket before the
+ *   first command's own deadline, so the first request waits that one timeout and the tiers behind it, and
+ *   every later request, fail open at once while the client reconnects (the offline queue is off).
+ */
+function buildThrottlerRedisOptions() {
+    return {
+        ...(0, redis_options_1.redisConnectionOptions)(),
+        enableOfflineQueue: false,
+        autoResendUnfulfilledCommands: false,
+        commandTimeout: exports.THROTTLER_REDIS_COMMAND_TIMEOUT_MS,
+        socketTimeout: exports.THROTTLER_REDIS_SOCKET_TIMEOUT_MS,
+        maxRetriesPerRequest: null,
+    };
+}
+/** Dedicated client for throttler hit-count storage — separate from cache/queue clients. */
+function createThrottlerRedisClient() {
+    return new ioredis_1.default(buildThrottlerRedisOptions());
+}

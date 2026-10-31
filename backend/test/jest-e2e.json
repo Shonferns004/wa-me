@@ -1,0 +1,18 @@
+{
+  "moduleFileExtensions": ["js", "json"],
+  "rootDir": ".",
+  "testEnvironment": "node",
+  "testRegex": ".e2e-spec.js$",
+  "setupFiles": ["<rootDir>/setup-e2e.js"],
+  "transform": {
+    "^.+\\.js$": "babel-jest"
+  },
+  "transformIgnorePatterns": [
+    "node_modules/(?!(https-proxy-agent|socks-proxy-agent|agent-base|proxy-agent-negotiate)/)"
+  ],
+  "moduleNameMapper": {
+    "^puppeteer$": "<rootDir>/__mocks__/puppeteer.js"
+  },
+  "maxWorkers": 1,
+  "globalTeardown": "<rootDir>/teardown-e2e.js"
+}

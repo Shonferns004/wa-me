@@ -1,0 +1,122 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PluginSearchProvider = void 0;
+exports.validatePluginSearchResults = validatePluginSearchResults;
+const common_1 = require("@nestjs/common");
+/** Required string fields of a SearchHit (score stays optional), mirrored for runtime checks. */
+const SEARCH_HIT_STRING_FIELDS = [
+    'messageId',
+    'waMessageId',
+    'sessionId',
+    'chatId',
+    'body',
+    'snippet',
+    'type',
+    'direction',
+    'from',
+];
+/**
+ * Validate a SearchResults payload that crossed the worker IPC boundary, returning a description of the
+ * first violation or null when the shape is sound. The worker is not a security boundary and the wire
+ * payload is untrusted: a plugin bug (or hostile worker) can post anything as `results` — a fabricated
+ * `total`, a non-array `hits` (which would 500 the re-filter below), or hits missing the fields the
+ * dashboard renders. Rules mirror the declared SearchResults contract; extra fields are tolerated so an
+ * additive legit provider is never broken.
+ */
+function validatePluginSearchResults(results) {
+    if (!results || typeof results !== 'object' || Array.isArray(results))
+        return 'results must be an object';
+    const r = results;
+    if (!Array.isArray(r.hits))
+        return 'results.hits must be an array';
+    if (typeof r.total !== 'number' || !Number.isFinite(r.total) || r.total < 0) {
+        return 'results.total must be a finite number >= 0';
+    }
+    if (typeof r.tookMs !== 'number' || !Number.isFinite(r.tookMs) || r.tookMs < 0) {
+        return 'results.tookMs must be a finite number >= 0';
+    }
+    if (typeof r.provider !== 'string' || r.provider.length === 0)
+        return 'results.provider must be a non-empty string';
+    for (const [index, hit] of r.hits.entries()) {
+        if (!hit || typeof hit !== 'object' || Array.isArray(hit))
+            return `results.hits[${index}] must be an object`;
+        const h = hit;
+        for (const field of SEARCH_HIT_STRING_FIELDS) {
+            if (typeof h[field] !== 'string')
+                return `results.hits[${index}].${field} must be a string`;
+        }
+        if (typeof h.timestamp !== 'number' || !Number.isFinite(h.timestamp)) {
+            return `results.hits[${index}].timestamp must be a finite number`;
+        }
+        if (h.score !== undefined && (typeof h.score !== 'number' || !Number.isFinite(h.score))) {
+            return `results.hits[${index}].score must be a finite number when present`;
+        }
+    }
+    return null;
+}
+/**
+ * A SearchProvider backed by a sandboxed plugin's worker. The host routes a query to the worker via the
+ * search RPC (dispatchSearch); the plugin runs its own backend logic (Meilisearch, Elasticsearch, etc.)
+ * and returns SearchResults. health() reuses the worker's general healthCheck (healthy→ok, message→detail)
+ * — no search-specific health message (Part 1 decision). All vendor-specific logic lives in the plugin.
+ */
+class PluginSearchProvider {
+    label;
+    transport;
+    timeoutMs;
+    id;
+    constructor(pluginId, label, transport, timeoutMs) {
+        this.label = label;
+        this.transport = transport;
+        this.timeoutMs = timeoutMs;
+        this.id = `plugin:${pluginId}`;
+    }
+    async search(query) {
+        if (query.chatIds !== undefined) {
+            if (query.chatIds.length === 0)
+                return { hits: [], total: 0, tookMs: 0, provider: this.id };
+            // Filtering an already paginated plugin response cannot enforce scoped offsets or counts.
+            throw new common_1.ForbiddenException('Chat-restricted search requires the built-in search provider');
+        }
+        // The expanded id lists are the built-in provider's business; a plugin keeps the query shape it was
+        // written against (`chatId` and `from` as the caller sent them).
+        const pluginQuery = { ...query };
+        delete pluginQuery.chatIdAliases;
+        delete pluginQuery.fromAliases;
+        const reply = await this.transport.dispatchSearch({ query: pluginQuery, timeoutMs: this.timeoutMs });
+        if (!reply.ok)
+            throw new common_1.ServiceUnavailableException(reply.error);
+        // The result shape is untrusted wire data: reject an invalid payload with an honest 502 (bad
+        // upstream) instead of fabricating a 200 — or crashing the re-filter below into a 500.
+        const invalid = validatePluginSearchResults(reply.results);
+        if (invalid)
+            throw new common_1.BadGatewayException(`Search provider ${this.id} returned invalid results: ${invalid}`);
+        // The Go and Java SDKs decode tookMs, total and a hit's timestamp into integer fields, as the
+        // built-in provider only ever returns whole numbers there, so one fractional value from a plugin
+        // would fail the whole call client-side. The validator accepts any finite number: round here.
+        const results = {
+            ...reply.results,
+            total: Math.trunc(reply.results.total),
+            tookMs: Math.round(reply.results.tookMs),
+            hits: reply.results.hits.map(h => ({ ...h, timestamp: Math.trunc(h.timestamp) })),
+        };
+        // Keep the existing session defense: plugins must apply sessionIds before paging and counting.
+        // Preserve total for compliant pages; discard it when an out-of-scope hit is returned.
+        const sessionFilter = query.sessionIds?.length ? new Set(query.sessionIds) : null;
+        if (!sessionFilter)
+            return results;
+        const scoped = results.hits.filter(h => sessionFilter.has(h.sessionId));
+        const leaked = results.hits.length - scoped.length;
+        return {
+            hits: scoped,
+            total: leaked > 0 ? scoped.length : results.total,
+            tookMs: results.tookMs,
+            provider: results.provider,
+        };
+    }
+    async health() {
+        const result = await this.transport.healthCheck(this.timeoutMs);
+        return { ok: result.healthy, detail: result.message };
+    }
+}
+exports.PluginSearchProvider = PluginSearchProvider;
